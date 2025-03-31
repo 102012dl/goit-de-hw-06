@@ -1,0 +1,446 @@
+HW T 6 
+
+Повний покроковий алгоритм для виконання завдання на MacOS
+Ось повний єдиний покроковий алгоритм для виконання завдання з Apache Kafka та Spark Streaming на MacOS:
+Крок 1: Підготовка середовища
+Відкрийте Термінал (Applications → Utilities → Terminal)
+Встановіть Homebrew (якщо ще не встановлено):
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+
+Встановіть необхідне програмне забезпечення:
+brew install openjdk@11 python@3.10 kafka
+
+
+Додайте Java до шляху:
+echo 'export PATH="/opt/homebrew/opt/openjdk@11/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+
+
+Крок 2: Запуск Kafka
+Запустіть Zookeeper:
+brew services start zookeeper
+
+
+Запустіть Kafka:
+brew services start kafka
+
+
+Перевірте, що сервіси запущені:
+brew services list
+
+
+Крок 3: Створення Kafka топіків
+Створіть топік для даних сенсорів:
+kafka-topics --create --topic sensor-data --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+
+
+Створіть топік для алертів:
+kafka-topics --create --topic alerts --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+
+
+Перевірте, що топіки створені:
+kafka-topics --list --bootstrap-server localhost:9092
+
+
+Крок 4: Створення проєкту
+Створіть директорію для проєкту:
+mkdir -p ~/kafka_spark_project
+cd ~/kafka_spark_project
+
+
+Створіть і активуйте віртуальне середовище:
+python3 -m venv venv
+source venv/bin/activate
+
+
+Встановіть необхідні бібліотеки:
+pip install pyspark==3.3.0 kafka-python==2.0.2 pandas==1.5.3 numpy==1.24.3
+
+
+Крок 5: Створення файлу з умовами алертів
+Створіть файл alerts_conditions.csv:
+nano alerts_conditions.csv
+
+
+Вставте наступний вміст:
+alert_code,min_temp,max_temp,min_humidity,max_humidity,message
+TEMP_HIGH,-999,30,-999,-999,Temperature is too high
+TEMP_LOW,5,-999,-999,-999,Temperature is too low
+HUM_HIGH,-999,-999,-999,80,Humidity is too high
+HUM_LOW,-999,-999,30,-999,Humidity is too low
+CRITICAL,35,-999,85,-999,Critical values detected
+
+
+Збережіть файл: Ctrl+O, Enter, Ctrl+X
+Крок 6: Створення Python скриптів
+Генератор даних сенсорів (data_generator.py)
+Створіть файл:
+nano data_generator.py
+
+
+Вставте код:
+import json
+import random
+import time
+from datetime import datetime
+from kafka import KafkaProducer
+
+# Налаштування Kafka продюсера
+producer = KafkaProducer(
+    bootstrap_servers=['localhost:9092'],
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+)
+
+# Функція для генерації даних сенсорів
+def generate_sensor_data():
+    sensor_id = random.randint(1, 10)
+    temperature = round(random.uniform(0, 40), 2)
+    humidity = round(random.uniform(20, 90), 2)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    data = {
+        "id": sensor_id,
+        "temperature": temperature,
+        "humidity": humidity,
+        "timestamp": timestamp
+    }
+    
+    return data
+
+# Основний цикл для генерації та відправки даних
+try:
+    print("Starting data generation. Press Ctrl+C to stop.")
+    while True:
+        sensor_data = generate_sensor_data()
+        producer.send('sensor-data', sensor_data)
+        print(f"Sent: {sensor_data}")
+        time.sleep(1)  # Генерувати дані кожну секунду
+except KeyboardInterrupt:
+    producer.close()
+    print("Data generation stopped")
+
+
+Збережіть файл: Ctrl+O, Enter, Ctrl+X
+Обробник даних (spark_processor.py)
+Створіть файл:
+nano spark_processor.py
+
+
+Вставте код:
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, col, window, avg, lit, expr
+from pyspark.sql.types import StructType, StructField, IntegerType, DoubleType, StringType, TimestampType
+import pandas as pd
+from datetime import datetime
+
+# Створення Spark сесії
+spark = SparkSession.builder \
+    .appName("SensorDataProcessing") \
+    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0") \
+    .getOrCreate()
+
+# Налаштування рівня логування
+spark.sparkContext.setLogLevel("WARN")
+
+# Схема вхідних даних
+schema = StructType([
+    StructField("id", IntegerType()),
+    StructField("temperature", DoubleType()),
+    StructField("humidity", DoubleType()),
+    StructField("timestamp", StringType())
+])
+
+# Зчитування умов для алертів
+print("Loading alert conditions...")
+alerts_conditions = pd.read_csv("alerts_conditions.csv")
+alerts_df = spark.createDataFrame(alerts_conditions)
+alerts_df = alerts_df.withColumn("min_temp", col("min_temp").cast(DoubleType())) \
+                     .withColumn("max_temp", col("max_temp").cast(DoubleType())) \
+                     .withColumn("min_humidity", col("min_humidity").cast(DoubleType())) \
+                     .withColumn("max_humidity", col("max_humidity").cast(DoubleType()))
+
+print("Alert conditions loaded:")
+alerts_df.show(truncate=False)
+
+# Зчитування даних з Kafka
+print("Starting to read from Kafka...")
+kafka_df = spark \
+    .readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "sensor-data") \
+    .option("startingOffsets", "latest") \
+    .load()
+
+# Перетворення даних з JSON формату
+parsed_df = kafka_df \
+    .select(from_json(col("value").cast("string"), schema).alias("data")) \
+    .select("data.*") \
+    .withColumn("event_time", col("timestamp").cast(TimestampType()))
+
+# Агрегація даних з використанням вікна
+windowed_df = parsed_df \
+    .withWatermark("event_time", "10 seconds") \
+    .groupBy(window("event_time", "1 minute", "30 seconds")) \
+    .agg(avg("temperature").alias("avg_temperature"), avg("humidity").alias("avg_humidity"))
+
+# Функція для обробки кожного пакету даних
+def process_batch(batch_df, batch_id):
+    if batch_df.count() > 0:
+        print(f"\n--- Processing batch {batch_id} at {datetime.now()} ---")
+        print("Aggregated data:")
+        batch_df.show(truncate=False)
+        
+        # Cross join з умовами алертів
+        joined_df = batch_df.crossJoin(alerts_df)
+        
+        # Фільтрація для визначення алертів
+        alerts = joined_df.filter(
+            ((col("min_temp") != -999) & (col("avg_temperature") < col("min_temp"))) |
+            ((col("max_temp") != -999) & (col("avg_temperature") > col("max_temp"))) |
+            ((col("min_humidity") != -999) & (col("avg_humidity") < col("min_humidity"))) |
+            ((col("max_humidity") != -999) & (col("avg_humidity") > col("max_humidity")))
+        ).select(
+            col("window.start").alias("window_start"),
+            col("window.end").alias("window_end"),
+            col("avg_temperature"),
+            col("avg_humidity"),
+            col("alert_code"),
+            col("message")
+        )
+        
+        # Якщо є алерти, записати їх у Kafka
+        if alerts.count() > 0:
+            print("Alerts detected:")
+            alerts.show(truncate=False)
+            
+            # Підготовка даних для запису в Kafka
+            kafka_alerts = alerts.selectExpr(
+                "CAST(alert_code AS STRING) AS key",
+                "to_json(struct(*)) AS value"
+            )
+            
+            # Запис алертів у Kafka
+            kafka_alerts.write \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", "localhost:9092") \
+                .option("topic", "alerts") \
+                .save()
+            
+            print(f"Sent {alerts.count()} alerts to Kafka topic 'alerts'")
+        else:
+            print("No alerts detected in this batch")
+
+# Запуск стрімінгу з обробкою кожного пакету
+print("Starting streaming query...")
+query = windowed_df \
+    .writeStream \
+    .foreachBatch(process_batch) \
+    .outputMode("update") \
+    .start()
+
+# Інформаційне повідомлення
+print("Streaming query started. Waiting for data...")
+print("Press Ctrl+C to stop the application")
+
+try:
+    # Очікування завершення стрімінгу (або переривання з клавіатури)
+    query.awaitTermination()
+except KeyboardInterrupt:
+    print("\nStopping streaming query...")
+    query.stop()
+    print("Streaming query stopped")
+    spark.stop()
+    print("Spark session stopped")
+
+
+Збережіть файл: Ctrl+O, Enter, Ctrl+X
+Споживач алертів (alerts_consumer.py)
+Створіть файл:
+nano alerts_consumer.py
+
+
+Вставте код:
+import json
+from kafka import KafkaConsumer
+from datetime import datetime
+
+# Налаштування споживача для алертів
+consumer = KafkaConsumer(
+    'alerts',
+    bootstrap_servers=['localhost:9092'],
+    auto_offset_reset='latest',
+    value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+)
+
+print("Starting alerts consumer. Waiting for messages...")
+print("Press Ctrl+C to stop")
+
+# Обробка повідомлень
+try:
+    for message in consumer:
+        alert = message.value
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print("\n" + "=" * 60)
+        print(f"ALERT RECEIVED at {now}")
+        print("-" * 60)
+        print(f"Alert Code: {alert['alert_code']}")
+        print(f"Message: {alert['message']}")
+        print(f"Time Window: From {datetime.fromtimestamp(alert['window_start']/1000).strftime('%H:%M:%S')} to {datetime.fromtimestamp(alert['window_end']/1000).strftime('%H:%M:%S')}")
+        print(f"Average Temperature: {alert['avg_temperature']:.2f}°C")
+        print(f"Average Humidity: {alert['avg_humidity']:.2f}%")
+        print("=" * 60)
+except KeyboardInterrupt:
+    consumer.close()
+    print("\nConsumer stopped")
+
+
+Збережіть файл: Ctrl+O, Enter, Ctrl+X
+Крок 7: Альтернативний простіший обробник даних (simple_processor.py)
+Якщо у вас виникають проблеми зі Spark, можна використати простіший обробник:
+Створіть файл:
+nano simple_processor.py
+
+
+Вставте код:
+import json
+import pandas as pd
+import time
+from datetime import datetime
+from kafka import KafkaConsumer, KafkaProducer
+
+# Завантаження умов для алертів
+alerts_conditions = pd.read_csv('alerts_conditions.csv')
+print("Alert conditions loaded:")
+print(alerts_conditions)
+
+# Налаштування споживача
+consumer = KafkaConsumer(
+    'sensor-data',
+    bootstrap_servers=['localhost:9092'],
+    auto_offset_reset='latest',
+    group_id='processor-group',
+    value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+)
+
+# Налаштування продюсера
+producer = KafkaProducer(
+    bootstrap_servers=['localhost:9092'],
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+)
+
+# Змінні для агрегації
+data_buffer = []
+window_size = 60  # 1 хвилина в секундах
+slide_interval = 30  # 30 секунд
+last_process_time = time.time()
+
+print("Starting data processor. Press Ctrl+C to stop.")
+try:
+    for message in consumer:
+        # Отримання даних
+        data = message.value
+        data['timestamp_obj'] = datetime.strptime(data['timestamp'], "%Y-%m-%d %H:%M:%S")
+        data_buffer.append(data)
+        
+        # Видалення старих даних (старше 1 хвилини)
+        current_time = time.time()
+        one_minute_ago = datetime.now().timestamp() - window_size
+        data_buffer = [d for d in data_buffer if d['timestamp_obj'].timestamp() > one_minute_ago]
+        
+        # Обробка даних кожні 30 секунд
+        if current_time - last_process_time >= slide_interval and len(data_buffer) > 0:
+            print(f"\n--- Processing data at {datetime.now()} ---")
+            print(f"Buffer size: {len(data_buffer)} records")
+            
+            # Обчислення середніх значень
+            avg_temp = sum(d['temperature'] for d in data_buffer) / len(data_buffer)
+            avg_humidity = sum(d['humidity'] for d in data_buffer) / len(data_buffer)
+            
+            print(f"Average temperature: {avg_temp:.2f}°C")
+            print(f"Average humidity: {avg_humidity:.2f}%")
+            
+            # Перевірка умов алертів
+            for _, alert in alerts_conditions.iterrows():
+                is_alert = False
+                
+                # Перевірка температури
+                if alert['min_temp'] != -999 and avg_temp < alert['min_temp']:
+                    is_alert = True
+                if alert['max_temp'] != -999 and avg_temp > alert['max_temp']:
+                    is_alert = True
+                    
+                # Перевірка вологості
+                if alert['min_humidity'] != -999 and avg_humidity < alert['min_humidity']:
+                    is_alert = True
+                if alert['max_humidity'] != -999 and avg_humidity > alert['max_humidity']:
+                    is_alert = True
+                
+                # Якщо умова алерту виконується
+                if is_alert:
+                    alert_data = {
+                        'window_start': (datetime.now().timestamp() - window_size) * 1000,
+                        'window_end': datetime.now().timestamp() * 1000,
+                        'avg_temperature': avg_temp,
+                        'avg_humidity': avg_humidity,
+                        'alert_code': alert['alert_code'],
+                        'message': alert['message']
+                    }
+                    
+                    # Відправка алерту в Kafka
+                    producer.send('alerts', alert_data)
+                    print(f"ALERT: {alert['alert_code']} - {alert['message']}")
+            
+            last_process_time = current_time
+except KeyboardInterrupt:
+    consumer.close()
+    producer.close()
+    print("Processor stopped")
+
+
+Збережіть файл: Ctrl+O, Enter, Ctrl+X
+Крок 8: Запуск системи
+Запуск через окремі термінали
+Відкрийте три окремих термінали.
+У першому терміналі (Споживач алертів):
+cd ~/kafka_spark_project
+source venv/bin/activate
+python alerts_consumer.py
+
+
+У другому терміналі (Обробник даних):
+cd ~/kafka_spark_project
+source venv/bin/activate
+
+# Запустіть один з обробників (Spark або простий):
+# Варіант 1: З використанням Spark
+python spark_processor.py
+
+# АБО
+
+# Варіант 2: Простіший обробник без Spark
+python simple_processor.py
+
+
+У третьому терміналі (Генератор даних):
+cd ~/kafka_spark_project
+source venv/bin/activate
+python data_generator.py
+
+
+Крок 9: Спостереження за роботою системи
+У терміналі генератора ви побачите повідомлення про відправлені дані сенсорів
+У терміналі обробника ви побачите агреговані дані та виявлені алерти
+У терміналі споживача алертів ви побачите повідомлення про отримані алерти
+Крок 10: Завершення роботи
+Для зупинки скриптів натисніть Ctrl+C у кожному терміналі
+Деактивуйте віртуальне середовище:
+deactivate
+
+
+Для зупинки Kafka та Zookeeper (за потреби):
+brew services stop kafka
+brew services stop zookeeper
+
+
